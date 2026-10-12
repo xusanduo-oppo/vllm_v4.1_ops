@@ -1,65 +1,139 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-# Adapted from https://github.com/sgl-project/sglang/pull/2575
-import itertools
-import types
-
 import pytest
 import torch
 
-from tests.kernels.quant_utils import (
-    native_per_token_group_quant_fp8,
-    native_w8a8_block_matmul,
+import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from tests.kernels.moe.utils import (
+    make_dummy_moe_config,
+    make_test_quant_config,
+    make_test_weights,
+    modular_triton_fused_moe,
 )
-from tests.kernels.utils import fp8_ulp_distance
-from vllm.config import VllmConfig
-from vllm.model_executor.kernels.linear.scaled_mm.b12x import (
-    B12xFp8BlockScaledMMKernel,
-    _run_b12x_fp8_block_scaled_mm,
+try:
+    from .quant_utils import native_w8a8_block_matmul, native_per_token_group_quant_fp8
+except ImportError:    
+    from quant_utils import native_w8a8_block_matmul, native_per_token_group_quant_fp8
+
+from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.fused_moe import (
+    fused_experts,
+    fused_topk,
 )
-from vllm.model_executor.kernels.linear.scaled_mm.cutlass import cutlass_scaled_mm
-from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-    per_token_group_quant_fp8,
-    w8a8_triton_block_scaled_mm,
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.all2all_utils import (
+    maybe_make_prepare_finalize,
+)
+from vllm.model_executor.layers.fused_moe.config import (
+    fp8_w8a8_moe_quant_config,
+)
+from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
+    _valid_deep_gemm_shape,
+)
+from vllm.model_executor.layers.fused_moe.experts.triton_deep_gemm_moe import (
+    TritonOrDeepGemmExperts,
 )
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
-    fp8_gemm_nt,
-    get_tma_aligned_size,
+    get_mk_alignment_for_contiguous_layout,
     is_deep_gemm_e8m0_used,
-    per_block_cast_to_fp8,
-    should_use_deepgemm_for_fp8_linear,
-)
-from vllm.utils.flashinfer import (
-    flashinfer_fp8_blockscale_gemm,
-    has_flashinfer_fp8_blockscale_gemm,
 )
 from vllm.utils.import_utils import has_deep_gemm
 
-capability = current_platform.get_device_capability()
-if capability is None or capability < (9, 0):
+dg_available = has_deep_gemm()
+
+if current_platform.get_device_capability() < (9, 0):
     pytest.skip("FP8 Triton requires CUDA 9.0 or higher", allow_module_level=True)
+if current_platform.is_fp8_fnuz():
+    pytest.skip(
+        "Tests in this file require float8_e4m3fn and platform does not support",
+        allow_module_level=True,
+    )
 
 vllm_config = VllmConfig()
 
 # Test configurations
 DTYPES = [torch.bfloat16]  # [torch.half, torch.bfloat16, torch.float32]
-# Quantization test configs
-NUM_TOKENS = [7, 2050]
-D = [512, 4096, 5120, 13824]
-GROUP_SIZE = [64, 128, 512]
-COLUMN_MAJOR_SCALES = [True, False]
-TMA_ALIGNED_SCALES = [True, False]
-# Matmul test configs
-M = [1, 7, 8, 83, 4096]
-N = [128, 512, 576, 7168, 13824]
-K = [256, 3884, 4096, 13824, 16384]
 # Deepseek-V3's intermediate size 18432, so N is 18432*2/8=4608 at TP8
 # and its hidden size is 7168.
+MNK_FACTORS = [
+    (1, 128, 128),
+    (1, 128, 7168),
+    (1, 1024, 7168),
+    (1, 4608, 128),
+    (1, 4608, 7168),
+    (83, 128, 128),
+    (83, 512, 512),
+    (83, 4608, 512),
+    (83, 4608, 7168),
+    (128, 512, 512),
+    (128, 1024, 7168),
+    (128, 4608, 7168),
+    (2048, 128, 128),
+    (2048, 1024, 7168),
+    (2048, 4608, 512),
+    (2048, 4608, 7168),
+    (8192, 128, 128),
+    (8192, 128, 7168),
+    (8192, 1024, 7168),
+    (8192, 4608, 7168),
+]
+
+MNK_FACTORS_DG = [
+    (128, 128, 128),
+    (128, 128, 7168),
+    (128, 1024, 7168),
+    (128, 4608, 128),
+    (128, 4608, 7168),
+    (192, 512, 512),
+    (192, 1024, 7168),
+    (192, 4608, 7168),
+    (1335, 128, 128),
+    (1335, 1024, 7168),
+    (1335, 4608, 512),
+    (1335, 4608, 7168),
+    (2048, 128, 128),
+    (2048, 128, 7168),
+    (2048, 1024, 7168),
+    (2048, 4608, 7168),
+]
+
 BLOCK_SIZE = [[128, 128]]
-OUT_DTYPES = [torch.bfloat16]  # [torch.float32, torch.half, torch.bfloat16]
+E = [2, 8, 16]  # [128, 256]
+TOP_KS = [1, 2, 6]
 SEEDS = [0]
+
+
+def torch_w8a8_block_fp8_moe(a, w1, w2, w1_s, w2_s, topk_weight, topk_ids, block_shape):
+    """Fused moe with block-wise quantization using native torch."""
+    B, D = a.shape
+    topk = topk_ids.size(1)
+    a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
+    out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
+
+    topk_weight = topk_weight.view(-1)
+    topk_ids = topk_ids.view(-1)
+
+    _, block_k = block_shape[0], block_shape[1]
+    a_q, a_s = native_per_token_group_quant_fp8(a, block_k)
+    a_q = a_q.to(torch.float32)
+    for i in range(w1.shape[0]):
+        mask = topk_ids == i
+        if mask.sum():
+            inter_out = native_w8a8_block_matmul(
+                a_q[mask], w1[i], a_s[mask], w1_s[i], block_shape, output_dtype=a.dtype
+            )
+            act_out = SiluAndMul().forward_native(inter_out)
+            act_out_q, act_out_s = native_per_token_group_quant_fp8(act_out, block_k)
+            out[mask] = native_w8a8_block_matmul(
+                act_out_q, w2[i], act_out_s, w2_s[i], block_shape, output_dtype=a.dtype
+            )
+    return (
+        out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
+    ).sum(dim=1)
+
 
 # Skip all tests if CUDA is not available
 pytest.importorskip("torch.cuda")
@@ -70,354 +144,175 @@ def setup_cuda():
     torch.set_default_device("cuda")
 
 
-@pytest.mark.skipif(
-    current_platform.is_fp8_fnuz(),
-    reason="This platform supports e4m3fnuz, not e4m3fn.",
-)
-@pytest.mark.parametrize(
-    "num_tokens,d,dtype,group_size,column_major_scales,tma_aligned_scales,seed",
-    itertools.product(
-        NUM_TOKENS,
-        D,
-        DTYPES,
-        GROUP_SIZE,
-        COLUMN_MAJOR_SCALES,
-        TMA_ALIGNED_SCALES,
-        SEEDS,
-    ),
-)
+@pytest.mark.parametrize(("M", "N", "K"), MNK_FACTORS)
+@pytest.mark.parametrize("E", E)
+@pytest.mark.parametrize("topk", TOP_KS)
+@pytest.mark.parametrize("block_size", BLOCK_SIZE)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seed", SEEDS)
 @torch.inference_mode()
-def test_per_token_group_quant_fp8(
-    num_tokens, d, dtype, group_size, column_major_scales, tma_aligned_scales, seed
+def test_w8a8_block_fp8_fused_moe(
+    M, N, K, E, topk, block_size, dtype, seed, monkeypatch, workspace_init
 ):
-    torch.manual_seed(seed)
-    x = torch.rand(num_tokens, d, dtype=dtype)
+    if topk > E:
+        pytest.skip(f"Skipping test; topk={topk} > E={E}")
 
-    ref_out, ref_scale = native_per_token_group_quant_fp8(x, group_size)
-    out, scale = per_token_group_quant_fp8(
-        x,
-        group_size,
-        column_major_scales=column_major_scales,
-        tma_aligned_scales=tma_aligned_scales,
+    torch.manual_seed(seed)
+
+    a = torch.randn((M, K), dtype=dtype) / 10
+    score = torch.randn((M, E), dtype=dtype)
+
+    w1, w2, quant_config = make_test_quant_config(
+        E,
+        N,
+        K,
+        dtype,
+        quant_dtype=torch.float8_e4m3fn,
+        per_act_token_quant=False,
+        block_shape=block_size,
     )
 
-    if current_platform.is_rocm():
-        # On gfx950 the Triton and PyTorch FP8 kernels can round in opposite
-        # directions when an element lands at the midpoint between two adjacent
-        # e4m3fn values (1-ULP tie-breaking). Verify: (1) no element is more
-        # than 1 FP8 ULP away, and (2) fewer than 0.05% of elements have any
-        # mismatch. Observed worst case across all parameter combos: 0.049%,
-        # max ULP = 1.
-        ulp = fp8_ulp_distance(out, ref_out)
-        assert (ulp <= 1).all(), (
-            f"FP8 mismatch > 1 ULP: {int((ulp > 1).sum())} elements"
+    m_fused_moe = modular_triton_fused_moe(make_dummy_moe_config(), quant_config)
+
+    topk_weights, topk_ids, _ = fused_topk(a, score.float(), topk, False)
+
+    # Set the context to avoid lots of warning spam.
+    with set_current_vllm_config(vllm_config):
+        ref_out = torch_w8a8_block_fp8_moe(
+            a,
+            w1,
+            w2,
+            quant_config.w1_scale,
+            quant_config.w2_scale,
+            topk_weights,
+            topk_ids,
+            block_size,
         )
-        assert float((ulp > 0).float().mean()) < 5e-4, (
-            f"Too many 1-ULP mismatches: {int((ulp > 0).sum())}/{ulp.numel()}"
+
+        out = fused_experts(
+            a, w1, w2, topk_weights, topk_ids, quant_config=quant_config
         )
-    else:
-        assert torch.allclose(
-            out.to(torch.float32), ref_out.to(torch.float32), rtol=0.15
+
+        m_out = m_fused_moe.apply(
+            a,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            activation=MoEActivation.SILU,
+            apply_router_weight_on_input=False,
+            expert_map=None,
+            global_num_experts=w1.shape[0],
         )
-    assert torch.allclose(scale, ref_scale)
 
-    if column_major_scales:
-        assert scale.stride()[-2] == 1
-        if tma_aligned_scales:
-            assert scale.stride()[-1] == get_tma_aligned_size(num_tokens, 4)
+    # 0.039 only needed for M >= 8192
+    tol = 0.035 if M < 8192 else 0.039
+    torch.testing.assert_close(out, ref_out, atol=tol, rtol=tol)
+    torch.testing.assert_close(m_out, ref_out, atol=tol, rtol=tol)
 
 
-@pytest.mark.parametrize(
-    "M,N,K,block_size,out_dtype,seed",
-    itertools.product(M, N, K, BLOCK_SIZE, OUT_DTYPES, SEEDS),
-)
+@pytest.mark.parametrize(("M", "N", "K"), MNK_FACTORS_DG)
+@pytest.mark.parametrize("E", E)
+@pytest.mark.parametrize("topk", TOP_KS)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.skipif(not dg_available, reason="DeepGemm kernels not available.")
+@pytest.mark.skipif(is_deep_gemm_e8m0_used(), reason="Not E8M0 scale MOE")
 @torch.inference_mode()
-def test_w8a8_block_fp8_matmul(M, N, K, block_size, out_dtype, seed):
-    torch.manual_seed(seed)
-    factor_for_scale = 1e-2
-    fp8_info = torch.finfo(current_platform.fp8_dtype())
-    fp8_max, fp8_min = fp8_info.max, fp8_info.min
+def test_w8a8_block_fp8_deep_gemm_fused_moe(M, N, K, E, topk, seed, monkeypatch):
+    if topk > E:
+        pytest.skip(f"Skipping test: topk={topk} > E={E}")
 
-    A_fp32 = (torch.rand(M, K, dtype=torch.float32) - 0.5) * 2 * fp8_max
-    A_fp8 = A_fp32.clamp(min=fp8_min, max=fp8_max).to(current_platform.fp8_dtype())
-
-    B_fp32 = (torch.rand(N, K, dtype=torch.float32) - 0.5) * 2 * fp8_max
-    B_fp8 = B_fp32.clamp(min=fp8_min, max=fp8_max).to(current_platform.fp8_dtype())
-
-    block_n, block_k = block_size[0], block_size[1]
-    n_tiles = (N + block_n - 1) // block_n
-    k_tiles = (K + block_k - 1) // block_k
-
-    As = torch.rand(M, k_tiles, dtype=torch.float32) * factor_for_scale
-    Bs = torch.rand(n_tiles, k_tiles, dtype=torch.float32) * factor_for_scale
-
-    ref_out = native_w8a8_block_matmul(A_fp8, B_fp8, As, Bs, block_size, out_dtype)
-    out = w8a8_triton_block_scaled_mm(A_fp8, B_fp8, As, Bs, block_size, out_dtype)
-
-    rel_diff = torch.mean(
-        torch.abs(out.to(torch.float32) - ref_out.to(torch.float32))
-    ) / torch.mean(torch.abs(ref_out.to(torch.float32)))
-    assert rel_diff < 0.001
-
-
-@pytest.mark.skipif(
-    not current_platform.is_cuda(), reason="CUTLASS only supported on CUDA platform."
-)
-@pytest.mark.parametrize(
-    # 65/66/67 cover all M%4 residue classes above the SM100 swapAB
-    # threshold (m <= 64); 1026 crosses multiple 128-row SF atoms.
-    "M",
-    [32, 65, 66, 67, 1026],
-)
-@torch.inference_mode()
-def test_w8a8_block_fp8_cutlass_matmul(M):
-    # Test simple case where weight.shape % 128 != 0,
-    # like in DSV3 kv_a_proj_with_mqa
-    N = 576
-    K = 7168
-    block_size = [128, 128]
-    out_dtype = torch.bfloat16
-    seed = 0
+    if not _valid_deep_gemm_shape(M, N, K):
+        pytest.skip(f"Skipping test: invalid size m={M}, n={N}, k={K}")
 
     torch.manual_seed(seed)
-    factor_for_scale = 1e-2
-    fp8_info = torch.finfo(torch.float8_e4m3fn)
-    fp8_max, fp8_min = fp8_info.max, fp8_info.min
 
-    A_fp32 = (torch.rand(M, K, dtype=torch.float32) - 0.5) * 2 * fp8_max
+    block_size = get_mk_alignment_for_contiguous_layout()
+    dtype = torch.bfloat16
 
-    B_fp32 = (torch.rand(N, K, dtype=torch.float32) - 0.5) * 2 * fp8_max
-    B_fp8 = B_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+    a = torch.randn((M, K), dtype=dtype) / 10
+    score = torch.randn((M, E), dtype=dtype)
 
-    block_n, block_k = block_size[0], block_size[1]
-    n_tiles = (N + block_n - 1) // block_n
-    k_tiles = (K + block_k - 1) // block_k
-
-    Bs = torch.rand(n_tiles, k_tiles, dtype=torch.float32) * factor_for_scale
-
-    A_fp8, As = per_token_group_quant_fp8(
-        A_fp32, block_size[1], column_major_scales=False
-    )
-    # CUTLASS uses column-major format for scales
-    A_fp8_cutlass, As_cutlass = per_token_group_quant_fp8(
-        A_fp32, block_size[1], column_major_scales=True
+    (_, w1, w1_s, _), (_, w2, w2_s, _) = make_test_weights(
+        E,
+        N,
+        K,
+        dtype,
+        torch.float8_e4m3fn,
+        per_out_ch_quant=False,
+        block_shape=block_size,
     )
 
-    ref_out = native_w8a8_block_matmul(A_fp8, B_fp8, As, Bs, block_size, out_dtype)
-    out = cutlass_scaled_mm(A_fp8_cutlass, B_fp8, As_cutlass, Bs, block_size, out_dtype)
+    # Note: for now use_compile will error out if the problem size is
+    # large enough to trigger chunking. I'm leaving the flag and
+    # setup code in case we are able to revisit this later.
+    use_compile = False
 
-    rel_diff = torch.mean(
-        torch.abs(out.to(torch.float32) - ref_out.to(torch.float32))
-    ) / torch.mean(torch.abs(ref_out.to(torch.float32)))
-    assert rel_diff < 0.001
+    use_cudagraph = N >= 1024 and K >= 1024 and current_platform.is_cuda_alike()
 
+    topk_weights, topk_ids, _ = fused_topk(a, score.float(), topk, False)
 
-@pytest.mark.skipif(
-    not (current_platform.is_cuda() and current_platform.has_device_capability(90)),
-    reason="torch._scaled_mm DeepSeek-style block scaling only supports SM90.",
-)
-def test_w8a8_block_fp8_torch_scaled_mm_matmul():
-    # BlockWiseTorchFP8ScaledMMLinearKernel: 1x128 activation + 128x128 weight
-    # block scaling routed through torch._scaled_mm. M=83 is not a multiple of
-    # 4 so this also exercises the M-padding path.
-    from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
-        BlockWiseTorchFP8ScaledMMLinearKernel,
+    quant_config = fp8_w8a8_moe_quant_config(
+        w1_scale=w1_s,
+        w2_scale=w2_s,
+        block_shape=block_size,
+    )
+    moe_config = make_dummy_moe_config()
+
+    deep_gemm_experts = mk.FusedMoEKernel(
+        prepare_finalize=maybe_make_prepare_finalize(
+            moe=moe_config,
+            quant_config=quant_config,
+            allow_new_interface=True,
+            use_monolithic=False,
+        ),
+        fused_experts=TritonOrDeepGemmExperts(
+            moe_config=moe_config,
+            quant_config=quant_config,
+        ),
     )
 
-    M = 83
-    N = 576
-    K = 7168
-    block_size = [128, 128]
-    out_dtype = torch.bfloat16
-    seed = 0
-
-    torch.manual_seed(seed)
-    factor_for_scale = 1e-2
-    fp8_info = torch.finfo(torch.float8_e4m3fn)
-    fp8_max, fp8_min = fp8_info.max, fp8_info.min
-
-    A_fp32 = (torch.rand(M, K, dtype=torch.float32) - 0.5) * 2 * fp8_max
-    B_fp32 = (torch.rand(N, K, dtype=torch.float32) - 0.5) * 2 * fp8_max
-    B_fp8 = B_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
-
-    block_n, block_k = block_size[0], block_size[1]
-    n_tiles = (N + block_n - 1) // block_n
-    k_tiles = (K + block_k - 1) // block_k
-    Bs = torch.rand(n_tiles, k_tiles, dtype=torch.float32) * factor_for_scale
-
-    # Reference uses row-major activation scales.
-    A_fp8, As = per_token_group_quant_fp8(
-        A_fp32, block_size[1], column_major_scales=False
-    )
-    ref_out = native_w8a8_block_matmul(A_fp8, B_fp8, As, Bs, block_size, out_dtype)
-
-    # The kernel expects column-major activation scales on CUDA.
-    A_fp8_cuda, As_cuda = per_token_group_quant_fp8(
-        A_fp32, block_size[1], column_major_scales=True
-    )
-
-    stub = BlockWiseTorchFP8ScaledMMLinearKernel.__new__(
-        BlockWiseTorchFP8ScaledMMLinearKernel
-    )
-    stub.config = types.SimpleNamespace(out_dtype=out_dtype)
-    out = stub.apply_block_scaled_mm(
-        A_fp8_cuda.cuda(), B_fp8.cuda(), As_cuda.cuda(), Bs.cuda()
-    )
-
-    ref_out = ref_out.cuda()
-    rel_diff = torch.mean(
-        torch.abs(out.to(torch.float32) - ref_out.to(torch.float32))
-    ) / torch.mean(torch.abs(ref_out.to(torch.float32)))
-    assert rel_diff < 0.001
-
-
-@pytest.mark.skipif(
-    current_platform.is_fp8_fnuz(),
-    reason="This platform supports e4m3fnuz, not e4m3fn.",
-)
-@pytest.mark.parametrize(
-    "M,N,K,block_size,out_dtype,seed",
-    itertools.product(M, N, K, BLOCK_SIZE, OUT_DTYPES, SEEDS),
-)
-@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGemm kernels not available.")
-@torch.inference_mode()
-def test_w8a8_block_fp8_deep_gemm_matmul(M, N, K, block_size, out_dtype, seed):
-    torch.manual_seed(seed)
-    fp8_info = torch.finfo(torch.float8_e4m3fn)
-    fp8_max = fp8_info.max
-
-    A_fp32 = (torch.rand(M, K, dtype=torch.float32) - 0.5) * 2 * fp8_max
-    B_fp32 = (torch.rand(N, K, dtype=torch.float32) - 0.5) * 2 * fp8_max
-
-    # only aligned sizes are supported by deepgemm
-    if not should_use_deepgemm_for_fp8_linear(
-        output_dtype=out_dtype, weight_shape=B_fp32.shape, supports_deep_gemm=True
-    ):
-        pytest.skip(f"Skipping test; invalid size {M}, {N}, {K}")
-
-    A_fp8, As_fp8 = per_token_group_quant_fp8(
-        A_fp32, block_size[1], column_major_scales=True, tma_aligned_scales=True
-    )
-    B_fp8, Bs_fp8 = per_block_cast_to_fp8(
-        B_fp32,
-        block_size=block_size,
-        use_ue8m0=is_deep_gemm_e8m0_used(),
-    )
-
-    As = As_fp8.to(torch.float32)
-    Bs = Bs_fp8.to(torch.float32)
-
-    ref_out = native_w8a8_block_matmul(A_fp8, B_fp8, As, Bs, block_size, out_dtype)
-
-    out = torch.zeros((M, N), device="cuda", dtype=out_dtype)
-
-    assert As_fp8.shape == (M, (K + 127) // 128), (
-        f"{As_fp8.shape} != {(M, (K + 127) // 128)}"
-    )
-
-    fp8_gemm_nt((A_fp8, As_fp8), (B_fp8, Bs_fp8), out)
-
-    rel_diff = torch.mean(
-        torch.abs(out.to(torch.float32) - ref_out.to(torch.float32))
-    ) / torch.mean(torch.abs(ref_out.to(torch.float32)))
-    assert rel_diff < 0.001
-
-
-@pytest.mark.skipif(
-    current_platform.is_fp8_fnuz(),
-    reason="This platform supports e4m3fnuz, not e4m3fn.",
-)
-@pytest.mark.parametrize(
-    "M,N,K,block_size,out_dtype,seed",
-    itertools.product(M, N, K, BLOCK_SIZE, OUT_DTYPES, SEEDS),
-)
-@torch.inference_mode()
-def test_w8a8_block_fp8_flashinfer_matmul(M, N, K, block_size, out_dtype, seed):
-    if not has_flashinfer_fp8_blockscale_gemm():
-        pytest.skip(
-            "FlashInfer block GEMM not available (requires SM90+ and FlashInfer)"
+    def deep_gemm_moe_fp8(a, w1, w2, w1_s, w2_s, topk_weights, topk_ids):
+        return deep_gemm_experts.apply(
+            hidden_states=a,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            global_num_experts=E,
+            activation=MoEActivation.SILU,
+            apply_router_weight_on_input=False,
+            expert_map=False,
         )
-    # only aligned sizes
-    if K % 128 != 0 or N % 64 != 0:
-        pytest.skip(f"Skipping test; invalid size {M}, {N}, {K}")
 
-    torch.manual_seed(seed)
-    fp8_info = torch.finfo(torch.float8_e4m3fn)
-    fp8_max = fp8_info.max
+    # Set the context to avoid lots of warning spam.
+    with set_current_vllm_config(vllm_config):
+        ref_out = torch_w8a8_block_fp8_moe(
+            a, w1, w2, w1_s, w2_s, topk_weights, topk_ids, block_size
+        )
 
-    A_bf16 = (torch.rand(M, K, dtype=torch.bfloat16) - 0.5) * 2 * fp8_max
-    B_bf16 = (torch.rand(N, K, dtype=torch.bfloat16) - 0.5) * 2 * fp8_max
+        if use_compile:
+            deep_gemm_moe_fp8_fn = torch.compile(
+                deep_gemm_moe_fp8, backend="inductor", fullgraph=True
+            )
+            torch._dynamo.mark_dynamic(a, 0)
+            torch._dynamo.mark_dynamic(topk_weights, 0)
+            torch._dynamo.mark_dynamic(topk_ids, 0)
+        else:
+            deep_gemm_moe_fp8_fn = deep_gemm_moe_fp8
 
-    A_fp8, As_fp8 = per_token_group_quant_fp8(A_bf16, block_size[1], use_ue8m0=False)
-    B_fp8, Bs_fp8 = per_block_cast_to_fp8(B_bf16, block_size, use_ue8m0=False)
+        out = deep_gemm_moe_fp8_fn(a, w1, w2, w1_s, w2_s, topk_weights, topk_ids)
 
-    As = As_fp8.to(torch.float32)
-    Bs = Bs_fp8.to(torch.float32)
+        if use_cudagraph:
+            out.fill_(0)
+            stream = torch.cuda.Stream()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                out = deep_gemm_moe_fp8_fn(
+                    a, w1, w2, w1_s, w2_s, topk_weights, topk_ids
+                )
+            torch.accelerator.synchronize()
+            graph.replay()
+            torch.accelerator.synchronize()
 
-    ref_out = native_w8a8_block_matmul(A_fp8, B_fp8, As, Bs, block_size, out_dtype)
-
-    out = flashinfer_fp8_blockscale_gemm(
-        input=A_bf16,
-        weight=B_fp8,
-        input_scale=None,
-        weight_scale=Bs,
-        out_dtype=out_dtype,
-    )
-
-    rel_diff = torch.mean(
-        torch.abs(out.to(torch.bfloat16) - ref_out.to(torch.bfloat16))
-    ) / torch.mean(torch.abs(ref_out.to(torch.bfloat16)))
-    assert rel_diff < 0.001
-
-
-@pytest.mark.parametrize(
-    "M,N,K",
-    [(1, 128, 256), (8, 256, 512), (129, 256, 256), (2, 4096, 4096)],
-)
-@torch.inference_mode()
-def test_w8a8_block_fp8_b12x_matmul(M, N, K):
-    supported, reason = B12xFp8BlockScaledMMKernel.is_supported()
-    if not supported:
-        pytest.skip(reason)
-
-    torch.manual_seed(M)
-    fp8_max = torch.finfo(torch.float8_e4m3fn).max
-    A_bf16 = (torch.rand(M, K, dtype=torch.bfloat16) - 0.5) * 2 * fp8_max
-    B_bf16 = (torch.rand(N, K, dtype=torch.bfloat16) - 0.5) * 2 * fp8_max
-    A_fp8, As = per_token_group_quant_fp8(A_bf16, 128, use_ue8m0=False)
-    B_fp8, Bs = per_block_cast_to_fp8(
-        B_bf16,
-        block_size=[128, 128],
-        use_ue8m0=False,
-    )
-    As = As.float()
-    Bs = Bs.float()
-
-    ref_out = native_w8a8_block_matmul(
-        A_fp8,
-        B_fp8,
-        As,
-        Bs,
-        [128, 128],
-        torch.bfloat16,
-    )
-    out = _run_b12x_fp8_block_scaled_mm(
-        A_fp8,
-        B_fp8,
-        As,
-        Bs,
-        torch.bfloat16,
-    )
-
-    rel_diff = torch.mean(torch.abs(out.float() - ref_out.float())) / torch.mean(
-        torch.abs(ref_out.float())
-    )
-    cosine = torch.nn.functional.cosine_similarity(
-        out.float().flatten(),
-        ref_out.float().flatten(),
-        dim=0,
-    )
-    # Four-way split-K uses atomic BF16 reductions, so nondeterministic atomic
-    # ordering can flap an output between adjacent BF16 values one ULP apart.
-    assert rel_diff < 0.003
-    assert cosine >= 0.99999
+    torch.testing.assert_close(out, ref_out, atol=0.035, rtol=0.035)

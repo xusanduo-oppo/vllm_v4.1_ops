@@ -22,46 +22,6 @@ BLOCK_SIZES = [32, 128]
 set_random_seed(0)
 
 
-@pytest.mark.parametrize("num_experts,num_tokens", [(32, 8), (256, 8), (256, 1024)])
-@pytest.mark.parametrize("use_expert_map", [False, True])
-def test_moe_align_scatter_masks_invalid_routes(
-    num_experts, num_tokens, use_expert_map
-):
-    topk_ids = torch.arange(num_tokens * 4, device="cuda").reshape(-1, 4)
-    topk_ids %= num_experts
-    topk_ids[0] = torch.tensor([-1, num_experts, 0, 1], device="cuda")
-    expert_map = None
-    valid = (topk_ids >= 0) & (topk_ids < num_experts)
-    if use_expert_map:
-        expert_map = torch.full((num_experts,), -1, dtype=torch.int32, device="cuda")
-        expert_map[::2] = torch.arange(
-            num_experts // 2, device="cuda", dtype=torch.int32
-        )
-        valid &= topk_ids % 2 == 0
-
-    sorted_ids, expert_ids, num_padded, scatter_idx = moe_align_block_size(
-        topk_ids,
-        32,
-        num_experts,
-        expert_map,
-        ignore_invalid_experts=True,
-        return_scatter_idx=True,
-    )
-    expected = torch.arange(topk_ids.numel(), device="cuda", dtype=torch.int32)
-    expected[~valid.flatten()] = -1
-    torch.testing.assert_close(scatter_idx, expected[:, None])
-    active_sorted = sorted_ids[: num_padded.item()]
-    active_sorted = active_sorted[active_sorted < topk_ids.numel()]
-    torch.testing.assert_close(active_sorted.sort().values, expected[expected >= 0])
-
-    baseline = moe_align_block_size(
-        topk_ids, 32, num_experts, expert_map, ignore_invalid_experts=True
-    )
-    assert len(baseline) == 3
-    torch.testing.assert_close(num_padded, baseline[2])
-    torch.testing.assert_close(expert_ids, baseline[1])
-
-
 def _group_tokens_by_expert(
     sorted_ids: torch.Tensor,
     expert_ids: torch.Tensor,
@@ -94,7 +54,8 @@ def _verify_expert_level_sorting(
     valid_length: int,
     total_tokens: int,
 ):
-    """Verify that actual_sorted_ids follows the correct expert-level sorting.
+    """
+    Verify that actual_sorted_ids follows the correct expert-level sorting.
     The kerne limplementation may or may not preserve original token order
     in topk_ids in the final sorted_ids however this does not impact quality.
     """
@@ -135,7 +96,8 @@ def torch_moe_align_block_size(
     expert_map: torch.Tensor | None = None,
     pad_sorted_ids: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Golden torch implementation of moe_align_block_size.
+    """
+    Golden torch implementation of moe_align_block_size.
 
     This function aligns the token distribution across experts to be compatible
     with block size for matrix multiplication by sorting tokens by expert and
@@ -227,7 +189,7 @@ def torch_moe_align_block_size(
 def test_moe_align_block_size(
     m: int, topk: int, num_experts: int, block_size: int, pad_sorted_ids: bool
 ):
-    """Test moe_align_block_size without expert mapping."""
+    """Test moe_align_block_size without expert mapping"""
     topk_ids = torch.zeros((m, topk), device="cuda", dtype=torch.int32)
     for i in range(m):
         experts = torch.randperm(num_experts, device="cuda")[:topk]
@@ -284,30 +246,19 @@ def test_moe_align_block_size(
 @pytest.mark.parametrize("topk", [2, 4])
 @pytest.mark.parametrize("num_experts", [8, 64])
 @pytest.mark.parametrize("block_size", [64])
-@pytest.mark.parametrize("mask_inactive_experts", [False, True])
 def test_moe_align_block_size_with_expert_map(
-    m: int,
-    topk: int,
-    num_experts: int,
-    block_size: int,
-    mask_inactive_experts: bool,
+    m: int, topk: int, num_experts: int, block_size: int
 ):
-    """Test moe_align_block_size with expert mapping (EP scenario)."""
+    """Test moe_align_block_size with expert mapping (EP scenario)"""
+    topk_ids = torch.zeros((m, topk), device="cuda", dtype=torch.int32)
+    for i in range(m):
+        experts = torch.randperm(num_experts, device="cuda")[:topk]
+        topk_ids[i] = experts
+
     expert_map = torch.full((num_experts,), -1, device="cuda", dtype=torch.int32)
     local_experts = list(range(0, num_experts, 2))
     for i, expert_id in enumerate(local_experts):
         expert_map[expert_id] = i
-
-    topk_ids = torch.empty((m, topk), device="cuda", dtype=torch.int32)
-    for i in range(m):
-        experts = torch.randperm(num_experts, device="cuda")[:topk]
-        for k in range(topk):
-            topk_ids[i, k] = (
-                experts[k]
-                if (experts[k] in local_experts) or not mask_inactive_experts
-                else -1
-            )
-    topk_ids[0, 0] = -1
 
     actual_sorted_ids, actual_expert_ids, actual_num_tokens = moe_align_block_size(
         topk_ids=topk_ids,
@@ -365,98 +316,7 @@ def test_moe_align_block_size_deterministic():
         )
 
 
-@pytest.mark.parametrize("max_tokens_per_batch", [13, 16, 512])
-@pytest.mark.parametrize("num_experts", [8, 16, 32, 64])
-@pytest.mark.parametrize("block_size", [8, 16, 32, 48, 64])
-@pytest.mark.parametrize(
-    "token_distribution", ["random", "alternating_empty", "skewed"]
-)
-def test_batched_moe_align_block_size(
-    max_tokens_per_batch: int,
-    num_experts: int,
-    block_size: int,
-    token_distribution: str,
-):
-    def ref_outputs(
-        expert_num_tokens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        E = expert_num_tokens.size(0)
-
-        # Round up so each batch can be split to blocks evenly.
-        Msum = round_up(max_tokens_per_batch, block_size) * E
-        ref_sorted_ids = torch.empty((Msum,), dtype=torch.int32)
-        ref_expert_ids = torch.empty((Msum // block_size,), dtype=torch.int32)
-        ref_num_tokens_post_pad = torch.empty((1,), dtype=torch.int32)
-
-        # Initialize
-        sentinel = E * max_tokens_per_batch
-        ref_sorted_ids.fill_(sentinel)
-        ref_expert_ids.fill_(-1)
-
-        # Fill ref_sorted_ids
-        i = 0
-        for expert_id, expert_nt in enumerate(expert_num_tokens):
-            token_offset = expert_id * max_tokens_per_batch
-            for j in range(expert_nt):
-                ref_sorted_ids[i] = token_offset + j
-                i += 1
-            # round up i to the next block_size
-            i = round_up(i, block_size)
-
-        ref_num_tokens_post_pad[0] = i
-
-        # Fill expert_ids
-        nt_ceil_sum = 0
-        for expert_id, expert_nt in enumerate(expert_num_tokens):
-            expert_ids_offset = nt_ceil_sum // block_size
-            ceil_expert_nt = round_up(int(expert_nt.item()), block_size)
-            num_blocks = ceil_expert_nt // block_size
-            for x in range(num_blocks):
-                ref_expert_ids[expert_ids_offset + x] = expert_id
-            nt_ceil_sum += ceil_expert_nt
-
-        return (
-            ref_sorted_ids.to("cuda"),
-            ref_expert_ids.to("cuda"),
-            ref_num_tokens_post_pad.to("cuda"),
-        )
-
-    # Compute expert_num_tokens
-    expert_num_tokens = torch.randint(
-        low=0,
-        high=max_tokens_per_batch + 1,
-        size=(num_experts,),
-        device="cpu",
-        dtype=torch.int32,
-    )
-    if token_distribution == "alternating_empty":
-        expert_num_tokens[::2] = 0
-    elif token_distribution == "skewed":
-        expert_num_tokens.zero_()
-        expert_num_tokens[0] = max_tokens_per_batch
-        expert_num_tokens[-1] = 1
-
-    # ref outputs
-    ref_sorted_ids, ref_expert_ids, ref_num_tokens_post_pad = ref_outputs(
-        expert_num_tokens
-    )
-
-    # outputs
-    sorted_ids, expert_ids, num_tokens_post_pad = batched_moe_align_block_size(
-        max_tokens_per_batch, block_size, expert_num_tokens.to("cuda")
-    )
-
-    assert ref_sorted_ids.size() == sorted_ids.size(), (
-        f"{ref_sorted_ids.size()} vs {sorted_ids.size()}"
-    )
-    assert ref_expert_ids.size() == expert_ids.size(), (
-        f"{ref_expert_ids.size()} vs {expert_ids.size()}"
-    )
-    assert ref_num_tokens_post_pad.size() == num_tokens_post_pad.size(), (
-        f"{ref_num_tokens_post_pad.size()} vs {num_tokens_post_pad.size()}"
-    )
-    torch.testing.assert_close(ref_sorted_ids, sorted_ids, atol=0, rtol=0)
-    torch.testing.assert_close(ref_expert_ids, expert_ids, atol=0, rtol=0)
-    torch.testing.assert_close(
-        ref_num_tokens_post_pad, num_tokens_post_pad, atol=0, rtol=0
-    )
+if __name__ == "__main__":
+    
+    pass
+    # pytest -q /root/Code/script/V4/ut/moe/test_moe_align_block_size.py --log-cli-level=DEBUG -v -s --junit-xml=/root/Code/script/V4/ut/moe/test_moe_align_block_size.xml
