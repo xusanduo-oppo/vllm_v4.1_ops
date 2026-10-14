@@ -20,7 +20,7 @@
 
 ### Image preprocess
 
-根据**最大的图片宽高比**，**最小像素点**，**图片的最大token数，**调整图片宽高
+根据最大的图片宽高比，最小像素点，图片的最大token数，调整图片宽高
 
 ```Plain Text
 def load_image(
@@ -43,10 +43,10 @@ def load_image(
     max_wh_ratio: 最大的宽高比
     
   output:
-    patches: torch.Tensor**
-        shape: [patches, C, patch_size, patch_size] = [num_patches, 3, 14, 14]**
-               patches = n_vit_h * n_vit_w**
-        dtype: bfloat16**
+    patches: torch.Tensor
+        shape: [patches, C, patch_size, patch_size] = [num_patches, 3, 14, 14]
+               patches = n_vit_h * n_vit_w
+        dtype: bfloat16
        
    n_vit_h: int
         vit input 块高 = best_height(调整后) // patch_size =  best_height // 14
@@ -97,7 +97,7 @@ def load_image(
        shape: [patches, hidden_size] = [patches, 1024]
        dtype: torch.bfloat16
           
-3. DeepseekV4VisionBlock * vision_num_hidden_layers**:
+3. DeepseekV4VisionBlock * vision_num_hidden_layers:
     3.1 DeepseekV4RMSNorm:
         input: rmsnorm
             x: 
@@ -123,7 +123,7 @@ def load_image(
             shape: [patches, 3*hidden_size] = [patches, 3072]
             dtype: torch.bfloat16
 
-        input: **rope(q), rope(k) -> attn(q, k, v) -> o**
+        input: rope(q), rope(k) -> attn(q, k, v) -> o
             q, k, v:
                 shape: [patches, hidden_size] = [patches, 1024]
                 dtype: torch.bfloat16
@@ -132,7 +132,7 @@ def load_image(
                 shape: [patches, hidden_size] = [patches, 1024]
                 dtype: torch.bfloat16
 
-        input: **wo(o) -> 0**
+        input: wo(o) -> 0
             vision.blocks.x.attn.wo.weight:
                 shape: [hidden_size, hidden_size] = [1024, 1024]
                 dtype: torch.bfloat16
@@ -144,7 +144,7 @@ def load_image(
                 shape: [patches, hidden_size] = [patches, 1024]
                 dtype: torch.bfloat16
         
-    3.3 DeepseekV4RMSNorm:**
+    3.3 DeepseekV4RMSNorm:
         input: 
             x: 
                 shape: [patches, hidden_size] = [patches, 1024]
@@ -159,7 +159,7 @@ def load_image(
   
     3.4. DeepseekV4VisionMLP
         input: 
-            attn_output: **w1(x) -> silu_and_mul(x) -> w2(x)**
+            attn_output: w1(x) -> silu_and_mul(x) -> w2(x)
                 shape: [patches, vision_dim] = [patches, 1024]
                 dtype: torch.bfloat16  
 
@@ -197,7 +197,7 @@ Aligner（对齐器/投影器） 的核心作用是将视觉编码器（ViT）�
             shape: [patches / 9, 9 * vision.hidden_size] = [patches / 9, 9216]
             dtype: torch.bfloat16     
   
-    input: **self.w1(x) -> self.w2(F.gelu(hidden))**
+    input: self.w1(x) -> self.w2(F.gelu(hidden))
         downsample_output:
             shape: [patches / 9, 9 * vision.hidden_size] = [patches, 9216]
             dtype: torch.bfloat16  
