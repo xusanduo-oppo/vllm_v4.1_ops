@@ -56,15 +56,15 @@ def load_image(
        
    n_llm_h: int
         llm input的块高 = math.ceil((best_height // patch_size) / downsample_ratio)
-                      = math.ceil((best_height // 14) / 3)
+                       = math.ceil((best_height // 14) / 3)
                 
    n_llm_w: int
         llm input的块宽 = math.ceil((best_width // patch_size) / downsample_ratio)
-                      = math.ceil((best_width // 14) / 3)
+                       = math.ceil((best_width // 14) / 3)
                     
    ### num_images_token = n_llm_h * (n_llm_w + 1) + 2
    ### images的token计算，包括分隔token 
-   ### [IMAGE_START] + ([IMAGE] * n_llm_w + [IMAGE_NEW_LINE]) * n_llm_h+ [IMAGE_END]
+   ### [IMAGE_START] + ([IMAGE] * n_llm_w + [IMAGE_NEW_LINE]) * n_llm_h + [IMAGE_END]
 ```
 
 ### ViT
